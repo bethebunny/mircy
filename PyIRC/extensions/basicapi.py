@@ -14,17 +14,154 @@ basic channel access control.
 
 from logging import getLogger
 
+from PyIRC.auxparse import prefix_parse, status_prefix_parse
 from PyIRC.extension import BaseExtension
+from PyIRC.event import LineEvent
+from PyIRC.line import Hostmask
+from PyIRC.hook import hook
+from PyIRC.numerics import Numerics
 
 
 logger = getLogger(__name__)
+
+
+class UserScopeEvent(LineEvent):
+
+    """User scope event, when a user goes in or out of view
+
+    .. warning::
+        This event is for mostly internal use at the moment and should only be
+        used if you know what you're doing.
+    """
+
+    CHANNEL = 0
+    """Channel level scope"""
+
+    GLOBAL = 1
+    """Global level scope"""
+
+    MESSAGE = 2
+    """PRIVMSG scope (may be transient and exit may be unknown)"""
+
+    MONITOR = 3
+    """Monitor level scope (server notification)"""
+
+    def __init__(self, event, line, hostmask, scope, location, entering,
+                 data=None):
+        """Initialise the event.
+
+        :param hostmask:
+            :py:class:`~PyIRC.line.Hostmask` of user changing scope.
+
+        :param scope:
+            The scope of the user.
+
+        :param location:
+            Location of scope, may be None for PRIVMSG or MONITOR
+
+        :param entering:
+            Whether or not the user is entering scope.
+
+        :param data:
+            Extra data, usually prefixes or such
+        """
+        super().__init__(event, line)
+
+        self.hostmask = hostmask
+        self.entering = entering
+        self.data = data
 
 
 class BasicAPI(BaseExtension):
 
     """Basic API functions, designed to make things easier to use"""
 
-    requires = ["ISupport"]
+    requires = ["BasicRFC", "ISupport"]
+
+    hook_classes = {
+        "userscope" : UserScopeEvent,
+    }
+
+    @hook("commands", Numerics.RPL_NAMREPLY)
+    def event_names(self, event):
+        line = event.line
+        params = line.params
+
+        location = params[2]
+
+        isupport = self.get_extension("ISupport")
+        prefix = prefix_parse(isupport.get("PREFIX"))
+
+        for userhost in params[-1].split(' '):
+            if not userhost:
+                return
+
+            modes, userhost = status_prefix_parse(userhost, prefix)
+            userhost = Hostmask.parse(userhost)
+
+            self.call_event("userscope", "enter", line, userhost,
+                            UserScopeEvent.CHANNEL, location, True, modes)
+
+    @hook("commands", "JOIN")
+    def event_join(self, event):
+        line = event.line
+        params = line.params
+
+        location = params[0]
+
+        cap_negotiate = self.get_extension("CapNegotiate")
+        if cap_negotiate and 'extended-join' in cap_negotiate.local:
+            account = params[1] if params[1] != '*' else ''
+            gecos = params[2]
+            data = (account, gecos)
+        else:
+            data = None
+
+        self.call_event("userscope", "enter", line, line.hostmask,
+                        UserScopeEvent.CHANNEL, location, True, data)
+
+    @hook("commands", "PART")
+    @hook("commands", "KICK")
+    def event_leave_channel(self, event):
+        line = event.line
+        params = line.params
+
+        location = params[0]
+        reason = params[1]
+
+        if line.command.upper() == "KICK":
+            victim = Hostmask(nick=params[2])
+            reason = params[3] if len(line.params) > 3 else None
+        else:
+            victim = line.hostmask
+            reason = params[2] if len(line.params) > 2 else None
+
+        self.call_event("userscope", "exit", line, victim,
+                        UserScopeEvent.CHANNEL, location, False, reason)
+
+    @hook("commands", "QUIT")
+    def event_quit(self, event):
+        line = event.line
+        params = line.params
+
+        data = params[0] if params else None
+
+        self.call_event("userscope", "exit", line, line.hostmask,
+                        UserScopeEvent.GLOBAL, None, False, data)
+
+    @hook("commands", "PRIVMSG")
+    @hook("commands", "NOTICE")
+    def event_message(self, event):
+        line = event.line
+        params = line.params
+
+        basicrfc = self.get_extension("BasicRFC")
+        if not self.casecmp(basicrfc.nick, params[0]):
+            return
+
+        data = params[1] if len(params) > 1 else None
+        self.call_event("userscope", "enter", line, line.hostmask,
+                        UserScopeEvent.MESSAGE, None, True, data)
 
     def message(self, target, message, notice=False):
         """Send a message to a target.
